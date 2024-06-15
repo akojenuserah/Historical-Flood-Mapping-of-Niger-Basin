@@ -1,0 +1,207 @@
+(1) TRYING TO KNOW THE WATER AND NON WATER AREA TO EXAMINE THIER RANGE
+
+*/
+
+//      (A)     LOADING THE IMAGE
+var waterArea = water;
+var nonWaterArea = nonwater;
+
+
+var water = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(waterArea)
+  .filterDate('2023-07-01','2023-07-30')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select(['VV'])
+  .limit(5000)
+  .map(function(image) { return image.clip(waterArea); //  cliping the image
+});
+//Adding the image to map to get an idea of what a SAR image looks like  
+Map.addLayer(water,{bands: 'VV'}, 'waterarea');
+var waterComposite = water.median();
+
+
+var nonwater = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(nonWaterArea)
+  .filterDate('2023-07-01','2023-07-30')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select(['VV'])
+  .limit(5000)
+  .map(function(image) { return image.clip(nonWaterArea); //  cliping the image
+});
+//Adding the image to map to get an idea of what a SAR image looks like  
+Map.addLayer(nonwater,{bands: 'VV'}, 'nonwaterarea');
+var nonWaterComposite = nonwater.median();
+
+
+
+//      (B)     PERFORMING SPECKLE FILTER
+
+var filterSpeckles = function(img) {
+  var vv = img.select('VV') //select the VV polarization band
+  var vv_smoothed = vv.focal_median(100,'circle','meters').rename('VV_Filtered') //Apply a focal median filter
+  return img.addBands(vv_smoothed) // Add filtered VV band to original image
+};
+
+// Map speckle noise filter across collection. Result is same collection, with smoothed VV band added to each image
+var waterfiltered = filterSpeckles(waterComposite)
+var nonWaterfiltered = filterSpeckles(nonWaterComposite)
+
+
+
+//(C) CREATING THE HISTOGRAM FOR EACH TO KNOW THE RANGE OF THE VALUES
+
+// Generate histogram for water area
+var waterHistogram = ui.Chart.image.histogram({
+  image: waterfiltered.select('VV_Filtered'),
+  region: waterArea,
+  scale: 30, // Adjust scale based on your data's resolution
+  maxPixels: 1e8
+});
+waterHistogram.setOptions({title: 'Histogram of VV values over Water Area'});
+
+
+// Generate histogram for non-water area
+var nonWaterHistogram = ui.Chart.image.histogram({
+  image: nonWaterfiltered.select('VV_Filtered'),
+  region: nonWaterArea,
+  scale: 30, // Adjust scale based on your data's resolution
+  maxPixels: 1e8
+});
+nonWaterHistogram.setOptions({title: 'Histogram of VV values over Non-Water Area'});
+
+// Print the histograms to the console
+print(waterHistogram);
+print(nonWaterHistogram);
+
+
+/*
+OBSERVATION: FROM THE TWO HISTOGRAMS WE CAN SEE THAT THE RANGE FOR 
+                  WATER BODY IS -22.17 TO -18.7
+                  NON WATERBODY IS -13.62 TO -8.12
+THIS WILL INFORM OUR THRESHOLD FOR WATER
+*/
+
+
+
+
+/*
+(2) LOADING OUR AREA OF INTEREST
+*/
+
+
+//    (A)     SPECIFYING THE REGION OF INTEREST
+
+var roi = table;
+Map.addLayer(roi, {}, 'ROI');
+Map.centerObject(roi, 8);
+
+
+//    (B)     LOADING AND FILTERING THE SENTINEL DATA
+
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate('2023-07-01','2023-07-30')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select(['VV'])
+  .limit(5000)
+  .map(function(image) { return image.clip(roi); //  This is to clip the image to the area of interest.
+});
+  
+//print(S1.size());
+
+//Adding the image to map to get an idea of what a SAR image looks like  
+Map.addLayer(S1,{bands: 'VV',min: -18, max: 0}, 'SAR image');
+
+
+
+//    (C)     FUNCTION TO APPLY SPECKEL FILTERING 
+
+
+var filterSpeckles = function(img) {
+  var vv = img.select('VV') //select the VV polarization band
+  var vv_smoothed = vv.focal_median(100,'circle','meters').rename('VV_Filtered') //Apply a focal median filter
+  return img.addBands(vv_smoothed) // Add filtered VV band to original image
+};
+
+// Map speckle noise filter across collection. Result is same collection, with smoothed VV band added to each image
+S1 = S1.map(filterSpeckles);
+
+//Add speckle filtered image to map to sompare with raw SAR image
+Map.addLayer(S1,{bands: 'VV_Filtered',min: -18, max: 0}, 'Filtered SAR image');
+
+
+var S = S1.median();
+
+
+//    (D)     DEFINIG OUR RANGE FOR THE WATER
+//var waterPixelRange = {min: -27, max: 6};
+var waterPixelRange = {min: -27, max: -12};
+
+
+//    (E)     DEFINING THE REDUCER TO GET THE MIN AND MAX VALUES OF PIXELS.
+
+var minMaxReducer = ee.Reducer.minMax();
+
+// Reduce the region. The region parameter is the Feature geometry.
+var minMax = S.reduceRegion({
+  reducer: minMaxReducer,
+  geometry: roi,
+  scale: 30, // Scale in meters; adjust depending on your needs.
+  maxPixels: 1e9 // Adjust this value to accommodate larger regions.
+});
+
+// Print the result to the console.
+print('Min and Max values:', minMax);
+
+
+
+//    (F)     CREATING THE MASK BASED ON PIXEL VALUES
+
+
+var waterMask = S.select('VV_Filtered').lte(waterPixelRange.max)
+                    .and(S.select('VV_Filtered').gte(waterPixelRange.min));
+                     
+                     
+                     
+var classifiedImage = waterMask.multiply(1)
+
+Map.addLayer(classifiedImage, {min: 0, max: 1, palette: ['white', 'blue']}, 'Classified Image');
+
+
+
+//    (G)     RECLASSIFING THE NONWATER PIXEL SO IT WILL NOT BE THE SAME LAYER 
+//AS THE DEFAUL PART OF THE MAP WHEN EXPORTED
+
+var reclassifiedImage = classifiedImage.where(classifiedImage.eq(0), 2);
+
+// Add reclassified non-water areas as a layer
+Map.addLayer(reclassifiedImage, {min: 0, max: 2, palette: ['000000', 'blue', 'white']}, 'Reclassified Image');
+
+
+
+
+// // Convert the masked feature to vector.
+// var vectors = classifiedImage.reduceToVectors({
+//   geometry: roi,
+//   scale: 50,
+//   geometryType: 'polygon',
+//   maxPixels: 1e13
+// });
+
+// //Print the vectors to the console or add them to the map.
+// print(vectors);
+// Map.addLayer(vectors);
+
+
+
+//    (H)     EXPORTING THE IMAGE FOR FURTHER ANALYSIS ON QGIS
+Export.image.toDrive({
+image: reclassifiedImage,
+folder: "GEE",
+description: 'JulyRECLASSIFIED,2023',
+scale: 30,
+fileFormat: 'GeoTIFF',
+region: roi,
+
+maxPixels: 1e12
+});

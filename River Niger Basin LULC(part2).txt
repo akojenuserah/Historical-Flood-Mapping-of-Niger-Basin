@@ -1,0 +1,410 @@
+var rgbVis = {min: 0.0, max: 3000, bands: ['B4', 'B3', 'B2']};
+
+
+var composite = composite.focal_mode({
+  radius: 2, // Adjust radius based on the scale of your analysis and size of gaps
+  kernelType: 'square',
+  units: 'pixels'
+});
+
+Map.addLayer(composite, sen2_imageVisParam, "composite");
+
+
+
+// var bandNames = ["VV", "VH"];
+  
+//      (5) MERGING OUR TRAING DATA TOGETHER
+//************************************************************************** 
+
+
+var sample = farmland.merge(water).merge(urban).merge(bareground).merge(vegetation);
+
+print("sample:",sample); 
+
+// Creating random samples of the data
+
+var dataset= sample.randomColumn();  
+
+
+//Splitting the train and test data
+
+
+var trainset = dataset.filter(ee.Filter.lessThan('random',0.8));
+var testset = dataset.filter(ee.Filter.greaterThanOrEquals('random', 0.8));
+
+print('Train set size:', trainset.size());
+print('Test set size:', testset.size());  
+
+ 
+ 
+//  Sample regions from the SAR image collection
+ 
+var training = composite.sampleRegions({
+  collection: trainset, // Set of geometries selected for training
+  properties: ['landcover'], // Label from each geometry
+  scale: 10 // Make each sample the same size as Landsat pixel
+}); // creates a column with random numbers
+
+//print(training.size());
+
+print("training:", training)
+
+
+
+
+
+
+//      TRAINING THE CLASSIFIER
+//************************************************************************** 
+
+    
+var Rclassifier = ee.Classifier.smileRandomForest(50).train({ 
+    features: training,
+    classProperty: 'landcover', //Pull the landcover property from classes
+    inputProperties: composite.bandNames()
+    });
+
+print(Rclassifier.getInfo());
+
+
+
+
+//      CLASSIFING THE IMAGE
+//************************************************************************** 
+
+
+ 
+var classified =   composite.classify(Rclassifier);
+
+print(typeof classified);
+
+// var clippedImage = sentClassified.clip(geometry);
+// Defining a palette for the Land Use classification.
+var palette = [ "#FFFFB2", "#1724ff", "#b2182b", "#8c510a", "#31A354" ];
+
+//var palette = [ '#7fc97f','#beaed4','#fdc086','#ffff99','#386cb0','#f0027f']
+Map.addLayer(classified.clip(geometry), {min: 0, max: 4, palette: palette}, "LULC");
+
+
+
+
+// ACCURACY ASSESMENT
+//************************************************************************** 
+
+
+// This is similar to machine learning practice
+var validation = composite.sampleRegions({
+  collection: testset,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 16
+});
+
+print(validation)
+// var test = normalize(test)
+var test = validation.classify(Rclassifier);
+
+var testConfusionMatrix = test.errorMatrix('landcover', 'classification');
+
+// Printing of confusion matrix may time out. Alternatively, you can export it as CSV
+print('Confusion Matrix', testConfusionMatrix);
+print('Test Accuracy', testConfusionMatrix.accuracy());
+
+
+
+
+// // POST PROCESSING BY CLUSTERING( This is to smotthen the classified image)
+// //************************************************************************** 
+
+
+// // Cluster using Unsupervised Clustering methods
+// var seeds = ee.Algorithms.Image.Segmentation.seedGrid(5);
+
+// var snic = ee.Algorithms.Image.Segmentation.SNIC({
+//   image: classified, 
+//   compactness: 4,
+//   connectivity: 8,
+//   neighborhoodSize: 10,
+//   size:4,
+//   seeds: seeds
+// })
+// var clusters = snic.select('clusters');
+
+// // Assign class to each cluster based on 'majority' voting (using ee.Reducer.mode()
+// var smoothed = classified.addBands(clusters).clip(geometry);
+
+// var clusterMajority = smoothed.reduceConnectedComponents({
+//   reducer: ee.Reducer.mode(),
+//   labelBand: 'clusters'
+// });
+
+
+// Map.addLayer(clusterMajority, {min: 0, max: 2, palette: palette}, 'Processed using Clusters');
+
+
+
+
+
+
+
+
+//      CLASSIFYING OTHER MONTHS
+//************************************************************************** 
+
+
+
+
+//b) Speckle Filtering functions using Refined Lee
+// Credit: SERVIR-Mekong, adapted from
+// https://mygeoblog.com/2021/01/21/sentinel-1-speckle-filter-refined-lee/
+
+function powerToDb(img){
+  return ee.Image(10).multiply(img.log10());
+}
+ 
+function dbToPower(img){
+  return ee.Image(10).pow(img.divide(10));
+}
+ 
+ 
+// The RL speckle filter
+function refinedLee(image) {
+  var date = image.date();
+  var bandNames = image.bandNames();
+  image = dbToPower(image);
+   
+  var result = ee.ImageCollection(bandNames.map(function(b){
+    var img = image.select([b]);
+     
+    // img must be in natural units, i.e. not in dB!
+    // Set up 3x3 kernels 
+    var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+    var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+   
+    var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+    var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+   
+    // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+    var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+   
+    var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+   
+    // Calculate mean and variance for the sampled windows and store as 9 bands
+    var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+    var sample_var = variance3.neighborhoodToBands(sample_kernel);
+   
+    // Determine the 4 gradients for the sampled windows
+    var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+    gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+    gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+    gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+   
+    // And find the maximum gradient amongst gradient bands
+    var max_gradient = gradients.reduce(ee.Reducer.max());
+   
+    // Create a mask for band pixels that are the maximum gradient
+    var gradmask = gradients.eq(max_gradient);
+   
+    // duplicate gradmask bands: each gradient represents 2 directions
+    gradmask = gradmask.addBands(gradmask);
+   
+    // Determine the 8 directions
+    var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+    directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+    directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+    directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+    // The next 4 are the not() of the previous 4
+    directions = directions.addBands(directions.select(0).not().multiply(5));
+    directions = directions.addBands(directions.select(1).not().multiply(6));
+    directions = directions.addBands(directions.select(2).not().multiply(7));
+    directions = directions.addBands(directions.select(3).not().multiply(8));
+   
+    // Mask all values that are not 1-8
+    directions = directions.updateMask(gradmask);
+   
+    // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+    directions = directions.reduce(ee.Reducer.sum());  
+   
+    //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+    //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+   
+    var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+   
+    // Calculate localNoiseVariance
+    var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+   
+    // Set up the 7*7 kernels for directional statistics
+    var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+   
+    var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+      [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+   
+    var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+    var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+   
+    // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+    var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+    var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+   
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+   
+    // and add the bands for rotated kernels
+    for (var i=1; i<4; i++) {
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    }
+   
+    // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+    dir_mean = dir_mean.reduce(ee.Reducer.sum());
+    dir_var = dir_var.reduce(ee.Reducer.sum());
+   
+    // A finally generate the filtered value
+    var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+   
+    var b = varX.divide(dir_var);
+   
+    return dir_mean.add(b.multiply(img.subtract(dir_mean)))
+      .arrayProject([0])
+      // Get a multi-band image bands.
+      .arrayFlatten([['sum']])
+      .float();
+  })).toBands().rename(bandNames);
+  var resultImage = powerToDb(ee.Image(result));
+  return resultImage.set('system:time_start', date.millis());
+}    
+
+
+// Defining the date range for the new imagery we want to classify
+var startDate = '2021-06-01'; 
+var endDate = '2021-07-01'; 
+
+
+// Loading the Sentinel-1 imagery 
+var filtered_s1= ee.ImageCollection('COPERNICUS/S1_GRD')
+            .filterBounds(geometry)
+            .filterDate(startDate, endDate)
+            .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+            .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+            .filter(ee.Filter.eq('instrumentMode', 'IW'))
+            
+
+var speckle_filtered = filtered_s1.map(refinedLee)
+                        
+
+var sarN = speckle_filtered.mean();
+
+//Map.addLayer(sarN.clip(geometry), {}, 'SAR_composite'); 
+
+
+
+
+// Loading the Sentinel-2 imagery 
+var filtered = ee.ImageCollection('COPERNICUS/S2')
+            .filterBounds(geometry)
+            .filterDate(startDate, endDate)
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) 
+            
+            
+// Load the Cloud Score+ collection
+
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+
+var filteredS2WithCs = filtered.linkCollection(csPlus, csPlusBands);
+
+// Function to mask pixels with low CS+ QA scores.
+function maskLowQA(image) {
+  var qaBand = 'cs';
+  var clearThreshold = 0.5;
+  var mask = image.select(qaBand).gte(clearThreshold);
+  return image.updateMask(mask);
+}
+
+var filteredMasked = filteredS2WithCs
+  .map(maskLowQA)
+  .select('B.*');
+  
+
+var senN = filteredMasked.median().clip(geometry);
+
+
+            
+
+// Combine Sentinel-1 and Sentinel-2 features 
+var combinedFeatures = senN.addBands(sarN);
+
+
+//normalising the bands
+
+function normalize(image){
+  var bandNames = image.bandNames();
+  // Compute min and max of the image
+  var minDict = image.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var maxDict = image.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var mins = ee.Image.constant(minDict.values(bandNames));
+  var maxs = ee.Image.constant(maxDict.values(bandNames));
+
+  var normalized = image.subtract(mins).divide(maxs.subtract(mins));
+  return normalized;
+}
+
+var Final_composite = normalize(combinedFeatures);
+
+//Map.addLayer(Final_composite.clip(geometry), rgbVis, 'normalised Composite');
+print("final composite:", Final_composite);
+
+
+
+
+// Applying the trained classifier to the final_composite image
+
+
+
+var classifiedImageNew = Final_composite.classify(Rclassifier);
+print(classifiedImageNew)
+// Visualize the classified image
+Map.centerObject(geometry, 8); 
+
+
+Map.addLayer(classifiedImageNew, {min: 0, max: 4, palette: palette}, 'Classified Image New');
+
+
+//Exporting the classified image to my asset
+Export.image.toAsset({
+  image: classifiedImageNew.clip(geometry),
+  description: "classifiedImageNew",
+  assetId: "users/akojenuserah2/classifiedImageNew",
+  pyramidingPolicy:"mode",
+  region: geometry,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+// Exporting the classified image to my Drvci)
+Export.image.toDrive({
+image: classifiedImageNew,
+folder: "GEE",
+description: 'ClassifiedImageNew',
+scale: 30,
+fileFormat: 'GeoTIFF',
+region: geometry,
+maxPixels: 1e12
+});
